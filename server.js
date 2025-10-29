@@ -1,65 +1,51 @@
 const express = require("express");
-const mysql = require("mysql2/promise");
+const mongoose = require("mongoose");
 const axios = require("axios");
+const Jimp = require("jimp");
 const fs = require("fs").promises;
 const path = require("path");
-const Jimp = require("jimp");
 require("dotenv").config();
 
 const app = express();
 app.use(express.json());
 
-// Database connection pool
-const pool = mysql.createPool({
-  host: process.env.DB_HOST || "127.0.0.1",
-  user: process.env.DB_USER || "root",
-  password: process.env.DB_PASSWORD || "",
-  database: process.env.DB_NAME || "countries_db",
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
+// MongoDB Connection
+const MONGODB_URI =
+  process.env.MONGODB_URI || "mongodb://localhost:27017/countries_db";
+
+mongoose
+  .connect(MONGODB_URI)
+  .then(() => console.log("✅ Connected to MongoDB"))
+  .catch((err) => console.error("❌ MongoDB connection error:", err));
+
+// Country Schema
+const countrySchema = new mongoose.Schema({
+  name: { type: String, required: true, unique: true },
+  capital: String,
+  region: String,
+  population: { type: Number, required: true },
+  currency_code: String,
+  exchange_rate: Number,
+  estimated_gdp: Number,
+  flag_url: String,
+  last_refreshed_at: { type: Date, default: Date.now },
 });
 
-// Initialize database
-async function initDatabase() {
-  const connection = await pool.getConnection();
-  try {
-    await connection.query(`
-      CREATE TABLE IF NOT EXISTS countries (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        name VARCHAR(255) NOT NULL UNIQUE,
-        capital VARCHAR(255),
-        region VARCHAR(255),
-        population BIGINT NOT NULL,
-        currency_code VARCHAR(10),
-        exchange_rate DECIMAL(20, 6),
-        estimated_gdp DECIMAL(30, 2),
-        flag_url TEXT,
-        last_refreshed_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        INDEX idx_region (region),
-        INDEX idx_currency (currency_code)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-    `);
+// Add indexes for better query performance
+countrySchema.index({ region: 1 });
+countrySchema.index({ currency_code: 1 });
+countrySchema.index({ estimated_gdp: -1 });
 
-    await connection.query(`
-      CREATE TABLE IF NOT EXISTS refresh_metadata (
-        id INT PRIMARY KEY DEFAULT 1,
-        last_refreshed_at DATETIME,
-        total_countries INT DEFAULT 0,
-        CHECK (id = 1)
-      )
-    `);
+const Country = mongoose.model("Country", countrySchema);
 
-    const [rows] = await connection.query(
-      "SELECT COUNT(*) as count FROM refresh_metadata"
-    );
-    if (rows[0].count === 0) {
-      await connection.query("INSERT INTO refresh_metadata (id) VALUES (1)");
-    }
-  } finally {
-    connection.release();
-  }
-}
+// Metadata Schema
+const metadataSchema = new mongoose.Schema({
+  _id: { type: String, default: "global" },
+  last_refreshed_at: Date,
+  total_countries: { type: Number, default: 0 },
+});
+
+const Metadata = mongoose.model("Metadata", metadataSchema);
 
 // Generate summary image using Jimp
 async function generateSummaryImage(totalCountries, topCountries, timestamp) {
@@ -67,10 +53,8 @@ async function generateSummaryImage(totalCountries, topCountries, timestamp) {
     const width = 800;
     const height = 600;
 
-    // Create image with background color
     const image = new Jimp(width, height, "#1a1a2e");
 
-    // Load fonts
     const fontLarge = await Jimp.loadFont(Jimp.FONT_SANS_32_WHITE);
     const fontMedium = await Jimp.loadFont(Jimp.FONT_SANS_16_WHITE);
     const fontSmall = await Jimp.loadFont(Jimp.FONT_SANS_14_WHITE);
@@ -155,7 +139,6 @@ async function generateSummaryImage(totalCountries, topCountries, timestamp) {
 
 // POST /countries/refresh
 app.post("/countries/refresh", async (req, res) => {
-  const connection = await pool.getConnection();
   try {
     // Fetch countries data
     let countriesData;
@@ -187,9 +170,9 @@ app.post("/countries/refresh", async (req, res) => {
       });
     }
 
-    await connection.beginTransaction();
-
     // Process each country
+    const bulkOps = [];
+
     for (const country of countriesData) {
       const name = country.name;
       const capital = country.capital || null;
@@ -211,91 +194,73 @@ app.post("/countries/refresh", async (req, res) => {
           estimatedGdp = (population * randomMultiplier) / exchangeRate;
         }
       } else {
-        // No currencies - set GDP to 0
         estimatedGdp = 0;
       }
 
-      // Insert or update
-      await connection.query(
-        `
-        INSERT INTO countries 
-        (name, capital, region, population, currency_code, exchange_rate, estimated_gdp, flag_url)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON DUPLICATE KEY UPDATE
-          capital = VALUES(capital),
-          region = VALUES(region),
-          population = VALUES(population),
-          currency_code = VALUES(currency_code),
-          exchange_rate = VALUES(exchange_rate),
-          estimated_gdp = VALUES(estimated_gdp),
-          flag_url = VALUES(flag_url),
-          last_refreshed_at = CURRENT_TIMESTAMP
-      `,
-        [
-          name,
-          capital,
-          region,
-          population,
-          currencyCode,
-          exchangeRate,
-          estimatedGdp,
-          flagUrl,
-        ]
-      );
+      // Prepare bulk operation (upsert)
+      bulkOps.push({
+        updateOne: {
+          filter: { name: name },
+          update: {
+            $set: {
+              capital,
+              region,
+              population,
+              currency_code: currencyCode,
+              exchange_rate: exchangeRate,
+              estimated_gdp: estimatedGdp,
+              flag_url: flagUrl,
+              last_refreshed_at: new Date(),
+            },
+          },
+          upsert: true,
+        },
+      });
+    }
+
+    // Execute bulk operations
+    if (bulkOps.length > 0) {
+      await Country.bulkWrite(bulkOps);
     }
 
     // Update metadata
-    const [countResult] = await connection.query(
-      "SELECT COUNT(*) as total FROM countries"
-    );
-    const totalCountries = countResult[0].total;
+    const totalCountries = await Country.countDocuments();
+    const now = new Date();
 
-    await connection.query(
-      `
-      UPDATE refresh_metadata 
-      SET last_refreshed_at = CURRENT_TIMESTAMP, total_countries = ?
-      WHERE id = 1
-    `,
-      [totalCountries]
+    await Metadata.findOneAndUpdate(
+      { _id: "global" },
+      {
+        last_refreshed_at: now,
+        total_countries: totalCountries,
+      },
+      { upsert: true, new: true }
     );
 
-    await connection.commit();
+    // Get top countries for image
+    const topCountries = await Country.find({ estimated_gdp: { $ne: null } })
+      .sort({ estimated_gdp: -1 })
+      .limit(5)
+      .lean();
 
-    // Get metadata for response and image
-    const [metadata] = await connection.query(
-      "SELECT * FROM refresh_metadata WHERE id = 1"
-    );
-    const [topCountries] = await connection.query(`
-      SELECT name, estimated_gdp 
-      FROM countries 
-      WHERE estimated_gdp IS NOT NULL
-      ORDER BY estimated_gdp DESC 
-      LIMIT 5
-    `);
-
-    // Generate summary image (optional)
+    // Generate summary image
     try {
       await generateSummaryImage(
         totalCountries,
         topCountries,
-        metadata[0].last_refreshed_at.toISOString()
+        now.toISOString()
       );
     } catch (imgError) {
       console.error("Failed to generate image:", imgError.message);
-      // Continue without image - not critical
     }
 
     res.json({
       message: "Countries data refreshed successfully",
       total_countries: totalCountries,
-      last_refreshed_at: metadata[0].last_refreshed_at,
+      last_refreshed_at: now,
     });
   } catch (error) {
-    await connection.rollback();
     console.error("Error refreshing countries:", error);
     res.status(500).json({ error: "Internal server error" });
-  } finally {
-    connection.release();
   }
 });
 
@@ -304,33 +269,32 @@ app.get("/countries", async (req, res) => {
   try {
     const { region, currency, sort } = req.query;
 
-    let query = "SELECT * FROM countries WHERE 1=1";
-    const params = [];
+    // Build query
+    const query = {};
 
     if (region) {
-      query += " AND LOWER(region) = LOWER(?)";
-      params.push(region);
+      query.region = new RegExp(`^${region}$`, "i");
     }
 
     if (currency) {
-      query += " AND currency_code = ?";
-      params.push(currency.toUpperCase());
+      query.currency_code = currency.toUpperCase();
     }
 
-    // Sorting
+    // Build sort
+    let sortOption = { name: 1 };
+
     if (sort === "gdp_desc") {
-      query += " ORDER BY estimated_gdp DESC";
+      sortOption = { estimated_gdp: -1 };
     } else if (sort === "gdp_asc") {
-      query += " ORDER BY estimated_gdp ASC";
+      sortOption = { estimated_gdp: 1 };
     } else if (sort === "population_desc") {
-      query += " ORDER BY population DESC";
+      sortOption = { population: -1 };
     } else if (sort === "population_asc") {
-      query += " ORDER BY population ASC";
-    } else {
-      query += " ORDER BY name ASC";
+      sortOption = { population: 1 };
     }
 
-    const [countries] = await pool.query(query, params);
+    const countries = await Country.find(query).sort(sortOption).lean();
+
     res.json(countries);
   } catch (error) {
     console.error("Error fetching countries:", error);
@@ -341,16 +305,15 @@ app.get("/countries", async (req, res) => {
 // GET /countries/:name
 app.get("/countries/:name", async (req, res) => {
   try {
-    const [countries] = await pool.query(
-      "SELECT * FROM countries WHERE LOWER(name) = LOWER(?)",
-      [req.params.name]
-    );
+    const country = await Country.findOne({
+      name: new RegExp(`^${req.params.name}$`, "i"),
+    }).lean();
 
-    if (countries.length === 0) {
+    if (!country) {
       return res.status(404).json({ error: "Country not found" });
     }
 
-    res.json(countries[0]);
+    res.json(country);
   } catch (error) {
     console.error("Error fetching country:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -360,12 +323,11 @@ app.get("/countries/:name", async (req, res) => {
 // DELETE /countries/:name
 app.delete("/countries/:name", async (req, res) => {
   try {
-    const [result] = await pool.query(
-      "DELETE FROM countries WHERE LOWER(name) = LOWER(?)",
-      [req.params.name]
-    );
+    const result = await Country.deleteOne({
+      name: new RegExp(`^${req.params.name}$`, "i"),
+    });
 
-    if (result.affectedRows === 0) {
+    if (result.deletedCount === 0) {
       return res.status(404).json({ error: "Country not found" });
     }
 
@@ -379,13 +341,18 @@ app.delete("/countries/:name", async (req, res) => {
 // GET /status
 app.get("/status", async (req, res) => {
   try {
-    const [metadata] = await pool.query(
-      "SELECT * FROM refresh_metadata WHERE id = 1"
-    );
+    let metadata = await Metadata.findById("global");
+
+    if (!metadata) {
+      metadata = {
+        total_countries: await Country.countDocuments(),
+        last_refreshed_at: null,
+      };
+    }
 
     res.json({
-      total_countries: metadata[0].total_countries,
-      last_refreshed_at: metadata[0].last_refreshed_at,
+      total_countries: metadata.total_countries,
+      last_refreshed_at: metadata.last_refreshed_at,
     });
   } catch (error) {
     console.error("Error fetching status:", error);
@@ -412,13 +379,6 @@ app.get("/", (req, res) => {
 // Start server
 const PORT = process.env.PORT || 3000;
 
-initDatabase()
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(`Server running on port ${PORT}`);
-    });
-  })
-  .catch((err) => {
-    console.error("Failed to initialize database:", err);
-    process.exit(1);
-  });
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
