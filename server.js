@@ -1,7 +1,6 @@
 const express = require("express");
 const mongoose = require("mongoose");
 const axios = require("axios");
-const Jimp = require("jimp");
 const fs = require("fs").promises;
 const path = require("path");
 require("dotenv").config();
@@ -9,32 +8,43 @@ require("dotenv").config();
 const app = express();
 app.use(express.json());
 
-// MongoDB Connection
+// MongoDB Connection with better error handling
 const MONGODB_URI =
   process.env.MONGODB_URI || "mongodb://localhost:27017/countries_db";
 
 mongoose
-  .connect(MONGODB_URI)
+  .connect(MONGODB_URI, {
+    serverSelectionTimeoutMS: 5000,
+    socketTimeoutMS: 45000,
+  })
   .then(() => console.log("✅ Connected to MongoDB"))
-  .catch((err) => console.error("❌ MongoDB connection error:", err));
+  .catch((err) => {
+    console.error("❌ MongoDB connection error:", err.message);
+    console.error(
+      "Make sure MongoDB is running or MONGODB_URI is correct in .env"
+    );
+  });
 
 // Country Schema
-const countrySchema = new mongoose.Schema({
-  name: { type: String, required: true, unique: true },
-  capital: String,
-  region: String,
-  population: { type: Number, required: true },
-  currency_code: String,
-  exchange_rate: Number,
-  estimated_gdp: Number,
-  flag_url: String,
-  last_refreshed_at: { type: Date, default: Date.now },
-});
+const countrySchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true, unique: true },
+    capital: String,
+    region: String,
+    population: { type: Number, required: true },
+    currency_code: String,
+    exchange_rate: Number,
+    estimated_gdp: Number,
+    flag_url: String,
+    last_refreshed_at: { type: Date, default: Date.now },
+  },
+  { timestamps: true }
+);
 
-// Add indexes for better query performance
 countrySchema.index({ region: 1 });
 countrySchema.index({ currency_code: 1 });
 countrySchema.index({ estimated_gdp: -1 });
+countrySchema.index({ name: 1 });
 
 const Country = mongoose.model("Country", countrySchema);
 
@@ -47,9 +57,18 @@ const metadataSchema = new mongoose.Schema({
 
 const Metadata = mongoose.model("Metadata", metadataSchema);
 
-// Generate summary image using Jimp
+// Generate summary image - with optional Jimp
 async function generateSummaryImage(totalCountries, topCountries, timestamp) {
   try {
+    // Try to load Jimp
+    let Jimp;
+    try {
+      Jimp = require("jimp");
+    } catch (e) {
+      console.log("Jimp not installed, skipping image generation");
+      return;
+    }
+
     const width = 800;
     const height = 600;
 
@@ -59,7 +78,6 @@ async function generateSummaryImage(totalCountries, topCountries, timestamp) {
     const fontMedium = await Jimp.loadFont(Jimp.FONT_SANS_16_WHITE);
     const fontSmall = await Jimp.loadFont(Jimp.FONT_SANS_14_WHITE);
 
-    // Title
     image.print(
       fontLarge,
       0,
@@ -71,7 +89,6 @@ async function generateSummaryImage(totalCountries, topCountries, timestamp) {
       width
     );
 
-    // Total countries
     image.print(
       fontMedium,
       0,
@@ -83,7 +100,6 @@ async function generateSummaryImage(totalCountries, topCountries, timestamp) {
       width
     );
 
-    // Top 5 header
     image.print(
       fontLarge,
       0,
@@ -95,9 +111,8 @@ async function generateSummaryImage(totalCountries, topCountries, timestamp) {
       width
     );
 
-    // Top countries list
     let yPos = 220;
-    for (let i = 0; i < topCountries.length && i < 5; i++) {
+    for (let i = 0; i < Math.min(topCountries.length, 5); i++) {
       const country = topCountries[i];
       const gdpFormatted = new Intl.NumberFormat("en-US", {
         style: "currency",
@@ -114,7 +129,6 @@ async function generateSummaryImage(totalCountries, topCountries, timestamp) {
       yPos += 45;
     }
 
-    // Timestamp
     image.print(
       fontSmall,
       0,
@@ -126,29 +140,76 @@ async function generateSummaryImage(totalCountries, topCountries, timestamp) {
       width
     );
 
-    // Save image
     const cacheDir = path.join(__dirname, "cache");
     await fs.mkdir(cacheDir, { recursive: true });
     await image.writeAsync(path.join(cacheDir, "summary.png"));
 
-    console.log("✅ Summary image generated successfully");
+    console.log("✅ Summary image generated");
   } catch (error) {
-    console.error("Failed to generate image:", error.message);
+    console.error("Image generation failed:", error.message);
   }
 }
+
+// Health check - must be first
+app.get("/", (req, res) => {
+  res.json({
+    message: "Country Currency & Exchange API",
+    status: "running",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// GET /status - must come before /:name routes
+app.get("/status", async (req, res) => {
+  try {
+    let metadata = await Metadata.findById("global");
+
+    if (!metadata) {
+      const count = await Country.countDocuments();
+      return res.json({
+        total_countries: count,
+        last_refreshed_at: null,
+      });
+    }
+
+    res.json({
+      total_countries: metadata.total_countries,
+      last_refreshed_at: metadata.last_refreshed_at,
+    });
+  } catch (error) {
+    console.error("Error fetching status:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// GET /countries/image - must come before /:name
+app.get("/countries/image", async (req, res) => {
+  try {
+    const imagePath = path.join(__dirname, "cache", "summary.png");
+    await fs.access(imagePath);
+    res.sendFile(imagePath);
+  } catch (error) {
+    res.status(404).json({ error: "Summary image not found" });
+  }
+});
 
 // POST /countries/refresh
 app.post("/countries/refresh", async (req, res) => {
   try {
+    console.log("Starting refresh...");
+
     // Fetch countries data
     let countriesData;
     try {
+      console.log("Fetching countries...");
       const countriesResponse = await axios.get(
         "https://restcountries.com/v2/all?fields=name,capital,region,population,flag,currencies",
-        { timeout: 10000 }
+        { timeout: 15000 }
       );
       countriesData = countriesResponse.data;
+      console.log(`Fetched ${countriesData.length} countries`);
     } catch (error) {
+      console.error("Countries API error:", error.message);
       return res.status(503).json({
         error: "External data source unavailable",
         details: "Could not fetch data from restcountries.com",
@@ -158,77 +219,91 @@ app.post("/countries/refresh", async (req, res) => {
     // Fetch exchange rates
     let exchangeRates;
     try {
+      console.log("Fetching exchange rates...");
       const ratesResponse = await axios.get(
         "https://open.er-api.com/v6/latest/USD",
-        { timeout: 10000 }
+        { timeout: 15000 }
       );
       exchangeRates = ratesResponse.data.rates;
+      console.log(
+        `Fetched ${Object.keys(exchangeRates).length} exchange rates`
+      );
     } catch (error) {
+      console.error("Exchange rates API error:", error.message);
       return res.status(503).json({
         error: "External data source unavailable",
         details: "Could not fetch data from open.er-api.com",
       });
     }
 
-    // Process each country
-    const bulkOps = [];
+    // Process countries in batches
+    console.log("Processing countries...");
+    const batchSize = 50;
+    let processedCount = 0;
 
-    for (const country of countriesData) {
-      const name = country.name;
-      const capital = country.capital || null;
-      const region = country.region || null;
-      const population = country.population || 0;
-      const flagUrl = country.flag || null;
+    for (let i = 0; i < countriesData.length; i += batchSize) {
+      const batch = countriesData.slice(i, i + batchSize);
+      const operations = [];
 
-      let currencyCode = null;
-      let exchangeRate = null;
-      let estimatedGdp = null;
+      for (const country of batch) {
+        const name = country.name;
+        const capital = country.capital || null;
+        const region = country.region || null;
+        const population = country.population || 0;
+        const flagUrl = country.flag || null;
 
-      // Handle currencies
-      if (country.currencies && country.currencies.length > 0) {
-        currencyCode = country.currencies[0].code;
+        let currencyCode = null;
+        let exchangeRate = null;
+        let estimatedGdp = null;
 
-        if (currencyCode && exchangeRates[currencyCode]) {
-          exchangeRate = exchangeRates[currencyCode];
-          const randomMultiplier = Math.random() * (2000 - 1000) + 1000;
-          estimatedGdp = (population * randomMultiplier) / exchangeRate;
+        if (country.currencies && country.currencies.length > 0) {
+          currencyCode = country.currencies[0].code;
+
+          if (currencyCode && exchangeRates[currencyCode]) {
+            exchangeRate = exchangeRates[currencyCode];
+            const randomMultiplier = Math.random() * (2000 - 1000) + 1000;
+            estimatedGdp = (population * randomMultiplier) / exchangeRate;
+          }
+        } else {
+          estimatedGdp = 0;
         }
-      } else {
-        estimatedGdp = 0;
+
+        operations.push({
+          updateOne: {
+            filter: { name: name },
+            update: {
+              $set: {
+                name,
+                capital,
+                region,
+                population,
+                currency_code: currencyCode,
+                exchange_rate: exchangeRate,
+                estimated_gdp: estimatedGdp,
+                flag_url: flagUrl,
+                last_refreshed_at: new Date(),
+              },
+            },
+            upsert: true,
+          },
+        });
       }
 
-      // Prepare bulk operation (upsert)
-      bulkOps.push({
-        updateOne: {
-          filter: { name: name },
-          update: {
-            $set: {
-              capital,
-              region,
-              population,
-              currency_code: currencyCode,
-              exchange_rate: exchangeRate,
-              estimated_gdp: estimatedGdp,
-              flag_url: flagUrl,
-              last_refreshed_at: new Date(),
-            },
-          },
-          upsert: true,
-        },
-      });
-    }
-
-    // Execute bulk operations
-    if (bulkOps.length > 0) {
-      await Country.bulkWrite(bulkOps);
+      if (operations.length > 0) {
+        await Country.bulkWrite(operations, { ordered: false });
+        processedCount += operations.length;
+        console.log(
+          `Processed ${processedCount}/${countriesData.length} countries`
+        );
+      }
     }
 
     // Update metadata
     const totalCountries = await Country.countDocuments();
     const now = new Date();
 
-    await Metadata.findOneAndUpdate(
-      { _id: "global" },
+    await Metadata.findByIdAndUpdate(
+      "global",
       {
         last_refreshed_at: now,
         total_countries: totalCountries,
@@ -236,22 +311,22 @@ app.post("/countries/refresh", async (req, res) => {
       { upsert: true, new: true }
     );
 
+    console.log("Refresh complete, generating image...");
+
     // Get top countries for image
-    const topCountries = await Country.find({ estimated_gdp: { $ne: null } })
+    const topCountries = await Country.find({
+      estimated_gdp: { $ne: null, $gt: 0 },
+    })
       .sort({ estimated_gdp: -1 })
       .limit(5)
       .lean();
 
-    // Generate summary image
-    try {
-      await generateSummaryImage(
-        totalCountries,
-        topCountries,
-        now.toISOString()
-      );
-    } catch (imgError) {
-      console.error("Failed to generate image:", imgError.message);
-    }
+    // Generate image (non-blocking)
+    generateSummaryImage(totalCountries, topCountries, now.toISOString()).catch(
+      (err) => {
+        console.error("Image generation error:", err.message);
+      }
+    );
 
     res.json({
       message: "Countries data refreshed successfully",
@@ -260,7 +335,10 @@ app.post("/countries/refresh", async (req, res) => {
     });
   } catch (error) {
     console.error("Error refreshing countries:", error);
-    res.status(500).json({ error: "Internal server error" });
+    res.status(500).json({
+      error: "Internal server error",
+      details: error.message,
+    });
   }
 });
 
@@ -269,7 +347,6 @@ app.get("/countries", async (req, res) => {
   try {
     const { region, currency, sort } = req.query;
 
-    // Build query
     const query = {};
 
     if (region) {
@@ -280,7 +357,6 @@ app.get("/countries", async (req, res) => {
       query.currency_code = currency.toUpperCase();
     }
 
-    // Build sort
     let sortOption = { name: 1 };
 
     if (sort === "gdp_desc") {
@@ -293,7 +369,10 @@ app.get("/countries", async (req, res) => {
       sortOption = { population: 1 };
     }
 
-    const countries = await Country.find(query).sort(sortOption).lean();
+    const countries = await Country.find(query)
+      .sort(sortOption)
+      .select("-__v -createdAt -updatedAt")
+      .lean();
 
     res.json(countries);
   } catch (error) {
@@ -307,7 +386,9 @@ app.get("/countries/:name", async (req, res) => {
   try {
     const country = await Country.findOne({
       name: new RegExp(`^${req.params.name}$`, "i"),
-    }).lean();
+    })
+      .select("-__v -createdAt -updatedAt")
+      .lean();
 
     if (!country) {
       return res.status(404).json({ error: "Country not found" });
@@ -338,47 +419,34 @@ app.delete("/countries/:name", async (req, res) => {
   }
 });
 
-// GET /status
-app.get("/status", async (req, res) => {
-  try {
-    let metadata = await Metadata.findById("global");
-
-    if (!metadata) {
-      metadata = {
-        total_countries: await Country.countDocuments(),
-        last_refreshed_at: null,
-      };
-    }
-
-    res.json({
-      total_countries: metadata.total_countries,
-      last_refreshed_at: metadata.last_refreshed_at,
-    });
-  } catch (error) {
-    console.error("Error fetching status:", error);
-    res.status(500).json({ error: "Internal server error" });
-  }
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({
+    error: "Internal server error",
+    message: err.message,
+  });
 });
 
-// GET /countries/image
-app.get("/countries/image", async (req, res) => {
-  try {
-    const imagePath = path.join(__dirname, "cache", "summary.png");
-    await fs.access(imagePath);
-    res.sendFile(imagePath);
-  } catch (error) {
-    res.status(404).json({ error: "Summary image not found" });
-  }
-});
-
-// Health check
-app.get("/", (req, res) => {
-  res.json({ message: "Country Currency & Exchange API", status: "running" });
+// Handle 404
+app.use((req, res) => {
+  res.status(404).json({ error: "Route not found" });
 });
 
 // Start server
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || "development"}`);
+  console.log(
+    `MongoDB: ${MONGODB_URI.includes("mongodb+srv") ? "Atlas" : "Local"}`
+  );
+});
+
+// Graceful shutdown
+process.on("SIGTERM", async () => {
+  console.log("SIGTERM received, closing server...");
+  await mongoose.connection.close();
+  process.exit(0);
 });
